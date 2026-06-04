@@ -127,11 +127,12 @@ This is useful when network topology changes or when you want the latest signal 
 
 ### Unknown Devices
 
-Devices that appear in neighbor tables but are not commissioned to your fabric are shown as "Unknown" with an orange icon. These could be:
+Devices that appear in neighbor or route tables but are not commissioned to your fabric are shown as "Unknown" with an orange icon. Because these tables live at the Thread mesh layer, an unknown entry is always a node on the **same** Thread network as your devices — just not reachable by us. They could be:
 
-- Devices commissioned to a different fabric (e.g., Home Assistant's Thread Border Router)
-- Border routers from other Thread networks
-- Thread devices in pairing mode
+- **Devices on a different Matter fabric**: a single Thread network is often shared by several fabrics (e.g. Home Assistant, Apple, Google). Their nodes and Border Routers are RF neighbors of your devices, but we cannot query them.
+- **Non-Matter Thread infrastructure**: Border Routers, range extenders, and other Thread devices (e.g. HomeKit-only Thread devices) that are not Matter devices and can never be commissioned.
+- **A Border Router under an unstable radio MAC**: some vendors (notably Apple and Aqara) randomize their Thread radio MAC at each reboot. The same physical Border Router then shows up twice — once as the known BR (matched via its stable MeshCoP `xa` identifier) and once here as an "External Router" carrying its current radio MAC. After such a reboot the old MAC lingers until neighbor tables age out.
+- **Stale entries**: a neighbor may keep listing a node that has left the network or a battery-powered (sleepy) device it has not heard from recently, until the entry ages out. Use the refresh button to re-read current tables; sometimes a device restart is needed before its tables drop the obsolete entry.
 
 Unknown devices show as "Router (external)" or "End Device (external)" based on their radio behavior (rxOnWhenIdle). Since they're not commissioned to this fabric, we cannot query their actual Thread role (Leader, Router, etc.).
 
