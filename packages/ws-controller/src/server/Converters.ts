@@ -90,7 +90,8 @@ export function convertWebSocketTagBasedToMatter(
 
     // Handle lists
     if (Array.isArray(value) && model.type === "list") {
-        return value.map(v => convertWebSocketTagBasedToMatter(v, model.members.at(0), clusterModel));
+        const memberModel = model.members.at(0);
+        return value.map(v => convertWebSocketTagBasedToMatter(v, memberModel, clusterModel));
     }
 
     // Handle structs - convert numeric keys to camelCased member names
@@ -98,18 +99,10 @@ export function convertWebSocketTagBasedToMatter(
         const valueKeys = Object.keys(value);
         const result: { [key: string]: unknown } = {};
 
-        // Build a map of member ID to member for efficient lookup
-        const memberById: { [id: number]: ValueModel } = {};
-        for (const member of model.members) {
-            if (member.id !== undefined) {
-                memberById[member.id] = member;
-            }
-        }
-
+        const memberById = getStructMembersById(model);
         for (const key of valueKeys) {
-            const memberId = parseInt(key);
-            if (!isNaN(memberId) && memberById[memberId]) {
-                const member = memberById[memberId];
+            const member = memberById.get(parseInt(key));
+            if (member !== undefined) {
                 result[member.propertyName] = convertWebSocketTagBasedToMatter(value[key], member, clusterModel);
             } else {
                 // Keep unknown keys as-is (fallback for unknown attributes)
@@ -136,7 +129,8 @@ export function convertCommandDataToMatter(
 
     // Handle lists
     if (Array.isArray(value) && model.type === "list") {
-        return value.map(v => convertCommandDataToMatter(v, model.members.at(0), clusterModel));
+        const memberModel = model.members.at(0);
+        return value.map(v => convertCommandDataToMatter(v, memberModel, clusterModel));
     }
 
     // Handle structs - convert numeric keys to camelCased member names
@@ -144,19 +138,12 @@ export function convertCommandDataToMatter(
         const valueKeys = Object.keys(value);
         const result: { [key: string]: unknown } = {};
 
-        // Build a map of member ID to member for efficient lookup
-        const memberByName: { [name: string]: ValueModel } = {};
-        for (const member of model.members) {
-            if (member.name !== undefined) {
-                memberByName[member.propertyName] = member;
-            }
-        }
-
+        const memberByName = getStructMembersByPropertyName(model);
         for (const key of valueKeys) {
             // Camelize the key to normalize PascalCase from Python CHIP SDK (e.g. DSTOffset -> dstOffset)
             const camelizedKey = camelize(key);
-            if (memberByName[camelizedKey]) {
-                const member = memberByName[camelizedKey];
+            const member = memberByName.get(camelizedKey);
+            if (member !== undefined) {
                 // Treat null for optional non-nullable fields as omitted (e.g. PINCode: null).
                 // This preserves compatibility with clients that send null instead of omitting the field.
                 if (value[key] === null && !member.mandatory && !member.nullable) {
@@ -186,6 +173,9 @@ const enum ConvKind {
     Struct,
     List,
 }
+
+/** Primitive `typeof` results that pass through unchanged for schema-less (unknown) attributes. */
+const PRIMITIVE_TYPEOF = new Set(["string", "number", "bigint", "boolean", "undefined"]);
 
 /** Cached model-to-kind classification. Avoids repeated metabase property traversal. */
 const modelKindCache = new WeakMap<ValueModel, ConvKind>();
@@ -238,6 +228,50 @@ function getStructMembers(model: ValueModel): StructMemberEntry[] {
         }
     }
     structMemberCache.set(model, members);
+    return members;
+}
+
+/**
+ * Struct member lookups for the incoming (WebSocket/legacy -> Matter) converters, cached per model so
+ * bulk conversions (e.g. legacy data migration) don't rebuild the map for every struct value.
+ */
+const structMembersByIdCache = new WeakMap<ValueModel, Map<number, ValueModel>>();
+const structMembersByPropertyNameCache = new WeakMap<ValueModel, Map<string, ValueModel>>();
+const structMembersByLowerNameCache = new WeakMap<ValueModel, Map<string, ValueModel>>();
+
+function getStructMembersById(model: ValueModel): Map<number, ValueModel> {
+    let members = structMembersByIdCache.get(model);
+    if (members !== undefined) return members;
+
+    members = new Map();
+    for (const member of model.members) {
+        if (member.id !== undefined) members.set(member.id, member);
+    }
+    structMembersByIdCache.set(model, members);
+    return members;
+}
+
+function getStructMembersByPropertyName(model: ValueModel): Map<string, ValueModel> {
+    let members = structMembersByPropertyNameCache.get(model);
+    if (members !== undefined) return members;
+
+    members = new Map();
+    for (const member of model.members) {
+        if (member.name !== undefined) members.set(member.propertyName, member);
+    }
+    structMembersByPropertyNameCache.set(model, members);
+    return members;
+}
+
+function getStructMembersByLowerName(model: ValueModel): Map<string, ValueModel> {
+    let members = structMembersByLowerNameCache.get(model);
+    if (members !== undefined) return members;
+
+    members = new Map();
+    for (const member of model.members) {
+        if (member.name !== undefined) members.set(member.name.toLowerCase(), member);
+    }
+    structMembersByLowerNameCache.set(model, members);
     return members;
 }
 
@@ -301,7 +335,7 @@ function convertMatterToWebSocket(
             // Best-effort: recursively convert elements without schema
             return value.map(v => convertMatterToWebSocket(v, undefined, clusterModel, tagBased));
         }
-        if (isObject(value) || !["string", "number", "bigint", "boolean", "undefined"].includes(typeof value)) {
+        if (isObject(value) || !PRIMITIVE_TYPEOF.has(typeof value)) {
             return null;
         }
         return value;
@@ -322,10 +356,13 @@ function convertMatterToWebSocket(
         case ConvKind.Bytes:
             return value instanceof Uint8Array ? Bytes.toBase64(value) : value;
 
-        case ConvKind.List:
-            return Array.isArray(value)
-                ? value.map(v => convertMatterToWebSocket(v, model.members.at(0), clusterModel, tagBased))
-                : value;
+        case ConvKind.List: {
+            if (!Array.isArray(value)) return value;
+            // Hoist the element model: `model.members` is a getter that rebuilds its array on every
+            // access, so reading it inside the map would rebuild it once per element.
+            const memberModel = model.members.at(0);
+            return value.map(v => convertMatterToWebSocket(v, memberModel, clusterModel, tagBased));
+        }
 
         case ConvKind.Struct: {
             if (!isObject(value)) return value;
@@ -549,7 +586,8 @@ export function convertWebsocketDataToMatter(value: any, model: ValueModel): any
             value = parseChipJSON(value);
         }
         if (Array.isArray(value)) {
-            return value.map(v => convertWebsocketDataToMatter(v, model.members.at(0)!));
+            const memberModel = model.members.at(0)!;
+            return value.map(v => convertWebsocketDataToMatter(v, memberModel));
         }
     }
 
@@ -558,19 +596,11 @@ export function convertWebsocketDataToMatter(value: any, model: ValueModel): any
             value = parseChipJSON(value);
         }
         if (typeof value === "object") {
-            const members = model.members.reduce(
-                (acc, member) => {
-                    if (member.name !== undefined) {
-                        acc[member.name.toLowerCase()] = member;
-                    }
-                    return acc;
-                },
-                {} as { [key: string]: ValueModel },
-            );
+            const members = getStructMembersByLowerName(model);
             const valueKeys = Object.keys(value);
             const result: { [key: string]: unknown } = {};
             valueKeys.forEach(key => {
-                const member = members[camelize(key).toLowerCase()];
+                const member = members.get(camelize(key).toLowerCase());
                 if (member !== undefined) {
                     result[member.propertyName] = convertWebsocketDataToMatter(value[key], member);
                 }
